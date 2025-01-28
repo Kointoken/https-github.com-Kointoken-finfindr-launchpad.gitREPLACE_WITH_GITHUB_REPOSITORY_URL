@@ -1,0 +1,707 @@
+import requests
+import logging
+import yaml
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey, Index, Boolean
+from sqlalchemy.orm import declarative_base
+from sqlalchemy.orm import sessionmaker
+import datetime
+from typing import Dict, Any, Optional, List
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import schedule
+import time
+import os
+import re
+from dotenv import load_dotenv
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from telegram import Bot, Update
+from telegram.ext import Updater, CommandHandler, CallbackContext
+import signal
+import sys
+from google.cloud import storage
+from google.cloud import secretmanager
+
+# ---------------------- Configuration Loading ----------------------
+
+def load_config(config_path='config.yaml'):
+    load_dotenv()  # Load environment variables from .env if using python-dotenv
+    try:
+        with open(config_path, 'r') as file:
+            config_content = file.read()
+        # Substitute environment variables in the format ${VAR_NAME}
+        config_content = re.sub(r'\$\{(\w+)\}', lambda match: os.getenv(match.group(1), ''), config_content)
+        config = yaml.safe_load(config_content)
+        logging.info('Configuration loaded successfully with environment variables.')
+        return config
+    except Exception as e:
+        logging.error(f'Failed to load configuration: {e}')
+        raise
+
+# ---------------------- Logging Configuration ----------------------
+
+def setup_logging():
+    """Configure logging for Google Cloud"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+
+def load_secrets():
+    """Load secrets from Google Cloud Secret Manager"""
+    client = secretmanager.SecretManagerServiceClient()
+    project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
+    
+    secrets = {}
+    secret_ids = [
+        'PUMPFUN_API_KEY',
+        'TWEETSCOUT_API_KEY',
+        'RUGCHECK_API_KEY',
+        'TELEGRAM_BOT_TOKEN',
+        'TELEGRAM_CHAT_ID'
+    ]
+    
+    for secret_id in secret_ids:
+        name = f"projects/{project_id}/secrets/{secret_id}/versions/latest"
+        response = client.access_secret_version(request={"name": name})
+        secrets[secret_id] = response.payload.data.decode('UTF-8')
+    
+    return secrets
+
+# ---------------------- Database Setup ----------------------
+
+Base = declarative_base()
+
+class MigratedCoin(Base):
+    __tablename__ = 'migrated_coins'
+    id: int = Column(Integer, primary_key=True)
+    coin_name: str = Column(String, nullable=False)
+    coin_symbol: str = Column(String, nullable=False, index=True)
+    migration_date: datetime.datetime = Column(DateTime, default=datetime.datetime.utcnow)
+    market_cap: float = Column(Float)
+    volume: float = Column(Float)
+    developer_id: str = Column(String)  # Assuming API provides developer ID
+    twitter_handle: str = Column(String)  # Twitter handle associated with the coin
+    contract_status: str = Column(String, nullable=True)  # e.g., "Good", "Bad"
+    supply_bundled: bool = Column(Boolean, default=False)  # Indicates if supply is bundled
+    contract_address: str = Column(String, nullable=True)  # Token contract address
+
+    __table_args__ = (
+        Index('idx_coin_symbol', 'coin_symbol'),
+    )
+
+class Tweet(Base):
+    __tablename__ = 'tweets'
+    id = Column(Integer, primary_key=True)
+    coin_id = Column(Integer, ForeignKey('migrated_coins.id'), nullable=False)
+    tweet_id = Column(String, unique=True, nullable=False)
+    content = Column(String, nullable=False)
+    sentiment = Column(Float)  # Sentiment score
+    created_at = Column(DateTime, nullable=False)
+    likes = Column(Integer)
+    retweets = Column(Integer)
+    # Add other relevant fields
+
+def setup_database(db_url='sqlite:///pumpfun_migrated_coins.db'):
+    engine = create_engine(db_url)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    logging.info('Database is set up.')
+    return Session()
+
+# ---------------------- API Configuration ----------------------
+
+def get_pumpfun_api_config(config):
+    try:
+        api_url = config['api']['pumpfun']['url']
+        api_key = config['api']['pumpfun']['key']
+        return api_url, api_key
+    except KeyError as e:
+        logging.error(f'Missing PumpFun API configuration: {e}')
+        raise
+
+def get_tweetscout_api_config(config):
+    try:
+        api_url = config['api']['tweetscout']['url']
+        api_key = config['api']['tweetscout']['key']
+        return api_url, api_key
+    except KeyError as e:
+        logging.error(f'Missing TweetScout API configuration: {e}')
+        raise
+
+def get_rugcheck_api_config(config):
+    try:
+        api_url = config['api']['rugcheck']['url']
+        api_key = config['api']['rugcheck']['key']
+        return api_url, api_key
+    except KeyError as e:
+        logging.error(f'Missing RugCheck.xyz API configuration: {e}')
+        raise
+
+def get_telegram_config(config):
+    try:
+        bot_token = config['telegram']['bot_token']
+        user_chat_id = config['telegram']['user_chat_id']
+        bonkbot_username = config['telegram']['bonkbot_username']
+        return bot_token, user_chat_id, bonkbot_username
+    except KeyError as e:
+        logging.error(f'Missing Telegram configuration: {e}')
+        raise
+
+# ---------------------- Sentiment Analyzer ----------------------
+
+analyzer = SentimentIntensityAnalyzer()
+
+def analyze_sentiment(text):
+    vs = analyzer.polarity_scores(text)
+    return vs['compound']
+
+# ---------------------- Trading Functions ----------------------
+
+def execute_trade(bot, bonkbot_username, action, coin_symbol, amount):
+    """
+    Execute a trade by sending a message to BonkBot via Telegram.
+
+    Parameters:
+    - bot: Telegram Bot instance
+    - bonkbot_username: Username of BonkBot (without @)
+    - action: 'buy' or 'sell'
+    - coin_symbol: Symbol of the coin to trade
+    - amount: Amount to trade
+    """
+    try:
+        command = f"/{action} {coin_symbol} {amount}"
+        bot.send_message(chat_id=f"@{bonkbot_username}", text=command)
+        logging.info(f"Executed trade: {action} {coin_symbol} {amount} via BonkBot.")
+    except Exception as e:
+        logging.error(f"Failed to execute trade: {e}")
+
+def send_notification(bot, user_chat_id, message):
+    """
+    Send a notification message to the user via Telegram.
+
+    Parameters:
+    - bot: Telegram Bot instance
+    - user_chat_id: Telegram chat ID of the user
+    - message: Message content to send
+    """
+    try:
+        bot.send_message(chat_id=user_chat_id, text=message)
+        logging.info(f"Sent notification to user: {message}")
+    except Exception as e:
+        logging.error(f"Failed to send notification: {e}")
+
+# ---------------------- Data Retrieval ----------------------
+
+def make_request(
+    url: str,
+    method: str = "GET",
+    params: Optional[Dict[str, Any]] = None,
+    headers: Optional[Dict[str, Any]] = None,
+    json_data: Optional[Dict[str, Any]] = None
+) -> requests.Response:
+    """Make an HTTP request with proper error handling and timeouts"""
+    try:
+        response = requests.request(
+            method=method.upper(),
+            url=url,
+            params=params,
+            headers=headers,
+            json=json_data,
+            timeout=30  # Add timeout for safety
+        )
+        response.raise_for_status()
+        return response
+    except requests.RequestException as e:
+        logging.error(f"Request failed: {e}")
+        raise
+
+def fetch_data(url: str, headers: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    """Fetch data from API with error handling"""
+    try:
+        response = make_request(url=url, headers=headers)
+        return response.json()
+    except Exception as e:
+        logging.error(f"Error fetching data: {e}")
+        return None
+
+def fetch_migrated_coins(pumpfun_url, pumpfun_key):
+    headers = {
+        'Authorization': f'Bearer {pumpfun_key}',
+        'Accept': 'application/json'
+    }
+    try:
+        response = requests.get(pumpfun_url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        logging.info('Successfully fetched migrated coins data.')
+        return data
+    except requests.exceptions.HTTPError as http_err:
+        logging.error(f'HTTP error occurred while fetching migrated coins: {http_err}')
+    except Exception as err:
+        logging.error(f'Other error occurred while fetching migrated coins: {err}')
+    return None
+
+def fetch_tweets(tweetscout_url, tweetscout_key, twitter_handle):
+    endpoint = f"{tweetscout_url}/tweets"  # Example endpoint
+    headers = {
+        'Authorization': f'Bearer {tweetscout_key}',
+        'Accept': 'application/json'
+    }
+    params = {
+        'twitter_handle': twitter_handle,
+        'limit': 100  # Number of tweets to fetch, adjust as needed
+    }
+    try:
+        response = requests.get(endpoint, headers=headers, params=params)
+        response.raise_for_status()
+        data = response.json()
+        logging.info(f"Successfully fetched tweets for @{twitter_handle}.")
+        return data
+    except requests.exceptions.HTTPError as http_err:
+        logging.error(f"HTTP error occurred while fetching tweets for @{twitter_handle}: {http_err}")
+    except Exception as err:
+        logging.error(f"Other error occurred while fetching tweets for @{twitter_handle}: {err}")
+    return None
+
+def fetch_rugcheck_status(rugcheck_url, rugcheck_key, contract_address):
+    endpoint = f"{rugcheck_url}/verify"
+    headers = {
+        'Authorization': f'Bearer {rugcheck_key}',
+        'Accept': 'application/json'
+    }
+    params = {
+        'contract_address': contract_address
+    }
+    try:
+        response = requests.get(endpoint, headers=headers, params=params)
+        response.raise_for_status()
+        data = response.json()
+        logging.info(f"RugCheck.xyz verification successful for contract {contract_address}.")
+        return data
+    except requests.exceptions.HTTPError as http_err:
+        logging.error(f"HTTP error occurred while verifying contract {contract_address}: {http_err}")
+    except Exception as err:
+        logging.error(f"Other error occurred while verifying contract {contract_address}: {err}")
+    return None
+
+# ---------------------- Data Filtering ----------------------
+
+def apply_filters(coin, filters):
+    # Market Cap Filter
+    market_cap = coin.get('market_cap', 0)
+    if market_cap < filters['market_cap']['min'] or market_cap > filters['market_cap']['max']:
+        logging.debug(f"Coin {coin.get('symbol')} excluded by market cap filter.")
+        return False
+
+    # Volume Filter
+    volume = coin.get('volume', 0)
+    if volume < filters['volume']['min']:
+        logging.debug(f"Coin {coin.get('symbol')} excluded by volume filter.")
+        return False
+
+    # Migration Date Filter
+    migration_date_str = coin.get('migration_date')
+    if not migration_date_str:
+        logging.warning(f"No migration date for coin {coin.get('symbol')}. Excluding.")
+        return False
+
+    try:
+        migration_date = datetime.datetime.strptime(migration_date_str, '%Y-%m-%dT%H:%M:%S')
+    except ValueError:
+        logging.warning(f"Invalid migration date format for coin {coin.get('symbol')}. Excluding.")
+        return False
+
+    start_date = datetime.datetime.strptime(filters['migration_date']['start'], '%Y-%m-%d')
+    end_date = datetime.datetime.strptime(filters['migration_date']['end'], '%Y-%m-%d')
+
+    if not (start_date <= migration_date <= end_date):
+        logging.debug(f"Coin {coin.get('symbol')} excluded by migration date filter.")
+        return False
+
+    return True
+
+# ---------------------- Blacklist Checks ----------------------
+
+def is_blacklisted(coin, blacklists, config):
+    # Check Coin Blacklist
+    if coin.get('coin_symbol') in blacklists['coins']:
+        logging.info(f"Coin {coin.get('coin_symbol')} is in the coin blacklist. Excluding.")
+        return True
+
+    # Check Developer Blacklist
+    developer_id = coin.get('developer_id')
+    if developer_id and developer_id in blacklists['developers']:
+        logging.info(f"Coin {coin.get('coin_symbol')} is developed by a blacklisted developer {developer_id}. Excluding.")
+        return True
+
+    # Check Twitter Account Blacklist
+    twitter_handle = config['coins_twitter'].get(coin.get('coin_symbol'), {}).get('twitter_handle')
+    if twitter_handle and twitter_handle in blacklists['twitter_accounts']:
+        logging.info(f"Coin {coin.get('coin_symbol')}'s Twitter handle @{twitter_handle} is blacklisted. Excluding.")
+        return True
+
+    return False
+
+# ---------------------- Saving Data ----------------------
+
+def save_migrated_coins(data, session, filters, blacklists, config, rugcheck_url, rugcheck_key):
+    for coin in data.get('coins', []):
+        if not apply_filters(coin, filters):
+            continue
+        if is_blacklisted(coin, blacklists, config):
+            continue
+
+        twitter_handle = config['coins_twitter'].get(coin.get('symbol'), {}).get('twitter_handle', 'unknown')
+
+        try:
+            migration_date = datetime.datetime.strptime(
+                coin.get('migration_date'), '%Y-%m-%dT%H:%M:%S')
+        except (ValueError, TypeError):
+            migration_date = datetime.datetime.utcnow()
+            logging.warning(f"Invalid date format for coin {coin.get('name')}. Using current time.")
+
+        migrated_coin = MigratedCoin(
+            coin_name=coin.get('name'),
+            coin_symbol=coin.get('symbol'),
+            migration_date=migration_date,
+            market_cap=coin.get('market_cap', 0.0),
+            volume=coin.get('volume', 0.0),
+            developer_id=coin.get('developer_id', 'unknown'),
+            twitter_handle=twitter_handle,
+            contract_address=coin.get('contract_address', 'unknown')  # Ensure 'contract_address' is provided
+            # Map other fields accordingly
+        )
+        session.add(migrated_coin)
+    try:
+        session.commit()
+        logging.info('Migrated coins data saved to the database.')
+    except Exception as e:
+        session.rollback()
+        logging.error(f'Error saving migrated coins to the database: {e}')
+
+    # After saving coins, perform RugCheck.xyz verification
+    migrated_coins = session.query(MigratedCoin).all()
+    for coin in migrated_coins:
+        if coin.contract_status:  # Already checked
+            continue
+        contract_address = coin.contract_address
+        if not contract_address or contract_address == 'unknown':
+            logging.warning(f"No contract address for {coin.coin_symbol}. Skipping RugCheck.xyz verification.")
+            continue
+        rugcheck_data = fetch_rugcheck_status(rugcheck_url, rugcheck_key, contract_address)
+        if rugcheck_data:
+            save_rugcheck_data(rugcheck_data, session, coin, config)
+
+def save_rugcheck_data(rugcheck_data, session, coin, config):
+    # Extract contract status and supply bundling information
+    contract_status = rugcheck_data.get('contract_status')  # e.g., "Good", "Bad"
+    supply_bundled = rugcheck_data.get('supply_bundled', False)
+
+    # Update the MigratedCoin entry
+    coin.contract_status = contract_status
+    coin.supply_bundled = supply_bundled
+
+    # Determine actions based on RugCheck.xyz data
+    if config['rugcheck']['require_good_contract'] and contract_status != 'Good':
+        logging.info(f"Coin {coin.coin_symbol} has a bad contract status. Blacklisting.")
+        if coin.coin_symbol not in config['blacklists']['coins']:
+            config['blacklists']['coins'].append(coin.coin_symbol)
+        if coin.developer_id not in config['blacklists']['developers']:
+            config['blacklists']['developers'].append(coin.developer_id)
+
+    if config['rugcheck']['check_supply_bundling'] and supply_bundled:
+        action = config['rugcheck']['bundled_supply_action']
+        if action == 'blacklist':
+            logging.info(f"Coin {coin.coin_symbol} has bundled supply. Blacklisting.")
+            if coin.coin_symbol not in config['blacklists']['coins']:
+                config['blacklists']['coins'].append(coin.coin_symbol)
+            if coin.developer_id not in config['blacklists']['developers']:
+                config['blacklists']['developers'].append(coin.developer_id)
+        elif action == 'notify':
+            # Implement notification logic if desired
+            logging.info(f"Coin {coin.coin_symbol} has bundled supply. Notification sent.")
+            # send_notification(...)
+        # Add other actions as needed
+
+    try:
+        session.commit()
+        logging.info(f"RugCheck.xyz data updated for {coin.coin_symbol}.")
+    except Exception as e:
+        session.rollback()
+        logging.error(f"Error updating RugCheck.xyz data for {coin.coin_symbol}: {e}")
+
+def save_tweets(data, session, coin, blacklisted_coins):
+    for tweet in data.get('tweets', []):
+        # Check if tweet already exists
+        existing_tweet = session.query(Tweet).filter_by(tweet_id=tweet.get('id')).first()
+        if existing_tweet:
+            logging.debug(f"Tweet {tweet.get('id')} already exists. Skipping.")
+            continue
+
+        # Analyze sentiment (assuming sentiment score is provided by the API)
+        sentiment_score = tweet.get('sentiment_score')  # Replace with actual field name
+
+        if sentiment_score is None:
+            # Perform sentiment analysis if not provided
+            sentiment_score = analyze_sentiment(tweet.get('content', ''))
+
+        new_tweet = Tweet(
+            coin_id=coin.id,
+            tweet_id=tweet.get('id'),
+            content=tweet.get('content'),
+            sentiment=sentiment_score,
+            created_at=datetime.datetime.strptime(tweet.get('created_at'), '%Y-%m-%dT%H:%M:%S'),
+            likes=tweet.get('likes', 0),
+            retweets=tweet.get('retweets', 0)
+            # Map other fields accordingly
+        )
+        session.add(new_tweet)
+    try:
+        session.commit()
+        logging.info(f"Tweets for {coin.coin_symbol} saved to the database.")
+    except Exception as e:
+        session.rollback()
+        logging.error(f"Error saving tweets for {coin.coin_symbol}: {e}")
+
+# ---------------------- Data Analysis ----------------------
+
+def analyze_patterns(session):
+    try:
+        # Query migration data
+        coins_df = pd.read_sql(session.query(MigratedCoin).statement, session.bind)
+
+        if coins_df.empty:
+            logging.warning('No migration data available for analysis.')
+            return
+
+        # Example Analysis: Market Cap Distribution
+        plt.figure(figsize=(10,6))
+        sns.histplot(coins_df['market_cap'].dropna(), bins=50, kde=True)
+        plt.title('Market Cap Distribution of Migrated Coins')
+        plt.xlabel('Market Cap')
+        plt.ylabel('Frequency')
+        plt.savefig('market_cap_distribution.png')
+        plt.close()
+
+        # Migration Over Time
+        coins_df['migration_date'] = pd.to_datetime(coins_df['migration_date'])
+        coins_df.set_index('migration_date', inplace=True)
+        migration_over_time = coins_df.resample('M').count()['id']
+        
+        plt.figure(figsize=(12,6))
+        migration_over_time.plot()
+        plt.title('Number of Migrated Coins Over Time')
+        plt.xlabel('Date')
+        plt.ylabel('Number of Migrations')
+        plt.savefig('migration_over_time.png')
+        plt.close()
+        
+        logging.info('Migration data analysis completed and visualizations saved.')
+    except Exception as e:
+        logging.error(f'Error during migration data analysis: {e}')
+
+def analyze_combined_patterns(session):
+    try:
+        # Query data from the database
+        coins_df = pd.read_sql(session.query(MigratedCoin).statement, session.bind)
+        tweets_df = pd.read_sql(session.query(Tweet).statement, session.bind)
+
+        if coins_df.empty:
+            logging.warning('No migration data available for analysis.')
+            return
+        if tweets_df.empty:
+            logging.warning('No tweet data available for analysis.')
+            return
+
+        # Merge DataFrames on coin_id
+        merged_df = pd.merge(tweets_df, coins_df, left_on='coin_id', right_on='id', suffixes=('_tweet', '_coin'))
+
+        # Example Analysis 1: Average Sentiment by Contract Status
+        sentiment_by_contract = merged_df.groupby('contract_status')['sentiment'].mean().reset_index()
+
+        plt.figure(figsize=(10,6))
+        sns.barplot(x='contract_status', y='sentiment', data=sentiment_by_contract)
+        plt.title('Average Sentiment by Contract Status')
+        plt.xlabel('Contract Status')
+        plt.ylabel('Average Sentiment Score')
+        plt.savefig('average_sentiment_by_contract_status.png')
+        plt.close()
+
+        # Example Analysis 2: Supply Bundling vs. Migration Rates
+        bundled_coins = coins_df[coins_df['supply_bundled'] == True]
+        non_bundled_coins = coins_df[coins_df['supply_bundled'] == False]
+
+        migration_bundled = bundled_coins.shape[0]
+        migration_non_bundled = non_bundled_coins.shape[0]
+
+        plt.figure(figsize=(8,6))
+        sns.barplot(x=['Bundled Supply', 'Non-Bundled Supply'], y=[migration_bundled, migration_non_bundled])
+        plt.title('Migration Counts Based on Supply Bundling')
+        plt.ylabel('Number of Migrations')
+        plt.savefig('migration_based_on_supply_bundling.png')
+        plt.close()
+
+        # Example Analysis 3: Engagement Metrics for Bundled vs. Non-Bundled Coins
+        engagement_bundled = merged_df[merged_df['supply_bundled'] == True][['likes', 'retweets']].mean()
+        engagement_non_bundled = merged_df[merged_df['supply_bundled'] == False][['likes', 'retweets']].mean()
+
+        engagement_data = pd.DataFrame({
+            'Bundled Supply': engagement_bundled,
+            'Non-Bundled Supply': engagement_non_bundled
+        }).transpose()
+
+        engagement_data.plot(kind='bar', figsize=(10,6))
+        plt.title('Average Engagement Metrics by Supply Bundling')
+        plt.ylabel('Average Count')
+        plt.savefig('engagement_metrics_by_supply_bundling.png')
+        plt.close()
+
+        # Example Analysis 4: Sentiment Correlation with Contract Status
+        plt.figure(figsize=(10,6))
+        sns.boxplot(x='contract_status', y='sentiment', data=merged_df)
+        plt.title('Sentiment Distribution by Contract Status')
+        plt.xlabel('Contract Status')
+        plt.ylabel('Sentiment Score')
+        plt.savefig('sentiment_distribution_by_contract_status.png')
+        plt.close()
+
+        # Example Analysis 5: Migration Counts by Contract Status
+        migration_by_contract = coins_df.groupby('contract_status').count()['id'].reset_index()
+        plt.figure(figsize=(10,6))
+        sns.barplot(x='contract_status', y='id', data=migration_by_contract)
+        plt.title('Migration Counts by Contract Status')
+        plt.xlabel('Contract Status')
+        plt.ylabel('Number of Migrations')
+        plt.savefig('migration_counts_by_contract_status.png')
+        plt.close()
+
+        logging.info('Combined RugCheck.xyz and social data analysis completed and visualizations saved.')
+    except Exception as e:
+        logging.error(f'Error during combined data analysis: {e}')
+
+# ---------------------- Trading and Notification ----------------------
+
+def decide_and_trade(session, config, bot, bonkbot_username, user_chat_id, trade_threshold, trade_amount):
+    """
+    Decide which tokens to trade based on analysis and execute trades via BonkBot.
+    Send notifications via Telegram.
+    """
+    try:
+        # Example Decision Logic:
+        # Buy tokens with average sentiment above positive_threshold
+        # Sell tokens with average sentiment below negative_threshold
+
+        # Query sentiment by coin
+        tweets_df = pd.read_sql(session.query(Tweet).statement, session.bind)
+        if tweets_df.empty:
+            logging.warning('No tweet data available for trading decisions.')
+            return
+
+        sentiment_by_coin = tweets_df.groupby('coin_id')['sentiment'].mean().reset_index()
+        merged_coins = pd.read_sql(session.query(MigratedCoin).statement, session.bind)
+        sentiment_merged = pd.merge(sentiment_by_coin, merged_coins, left_on='coin_id', right_on='id')
+
+        positive_threshold = config['analysis']['sentiment_threshold']['positive']
+        negative_threshold = config['analysis']['sentiment_threshold']['negative']
+
+        # Select coins to buy
+        coins_to_buy = sentiment_merged[sentiment_merged['sentiment'] >= positive_threshold]
+        # Select coins to sell
+        coins_to_sell = sentiment_merged[sentiment_merged['sentiment'] <= negative_threshold]
+
+        # Execute buys
+        for _, coin in coins_to_buy.iterrows():
+            execute_trade(bot, bonkbot_username, 'buy', coin['coin_symbol'], config['trading']['trade_amount'])
+            message = f"📈 **Buy Order Executed**\nCoin: {coin['coin_symbol']}\nAmount: {config['trading']['trade_amount']}"
+            send_notification(bot, user_chat_id, message)
+
+        # Execute sells
+        for _, coin in coins_to_sell.iterrows():
+            execute_trade(bot, bonkbot_username, 'sell', coin['coin_symbol'], config['trading']['trade_amount'])
+            message = f"📉 **Sell Order Executed**\nCoin: {coin['coin_symbol']}\nAmount: {config['trading']['trade_amount']}"
+            send_notification(bot, user_chat_id, message)
+
+        logging.info('Trading decisions executed based on sentiment analysis.')
+
+    except Exception as e:
+        logging.error(f'Error during trading decisions: {e}')
+
+# ---------------------- Job Scheduler ----------------------
+
+def job(config, session, bot, bonkbot_username, user_chat_id):
+    logging.info('Job started.')
+    try:
+        # Fetch PumpFun Advanced data
+        pumpfun_url, pumpfun_key = get_pumpfun_api_config(config)
+        pumpfun_data = fetch_migrated_coins(pumpfun_url, pumpfun_key)
+        if pumpfun_data:
+            rugcheck_url, rugcheck_key = get_rugcheck_api_config(config)
+            save_migrated_coins(pumpfun_data, session, config['filters'], config['blacklists'], config, rugcheck_url, rugcheck_key)
+    except Exception as e:
+        logging.error(f'Error during PumpFun data retrieval and saving: {e}')
+
+    try:
+        # Fetch and save tweets for each coin
+        tweetscout_url, tweetscout_key = get_tweetscout_api_config(config)
+        migrated_coins = session.query(MigratedCoin).all()
+        for coin in migrated_coins:
+            if coin.twitter_handle == 'unknown':
+                logging.warning(f"No Twitter handle for {coin.coin_symbol}. Skipping tweet analysis.")
+                continue
+            # Skip blacklisted coins
+            if coin.coin_symbol in config['blacklists']['coins']:
+                logging.info(f"Coin {coin.coin_symbol} is blacklisted. Skipping tweet analysis.")
+                continue
+            tweet_data = fetch_tweets(tweetscout_url, tweetscout_key, coin.twitter_handle)
+            if tweet_data:
+                save_tweets(tweet_data, session, coin, config['blacklists']['coins'])
+    except Exception as e:
+        logging.error(f'Error during TweetScout data retrieval and saving: {e}')
+
+    try:
+        # Perform data analysis
+        analyze_patterns(session)
+        analyze_combined_patterns(session)
+    except Exception as e:
+        logging.error(f'Error during data analysis: {e}')
+
+    try:
+        # Decide and execute trades
+        if config['trading']['enabled']:
+            decide_and_trade(session, config, bot, bonkbot_username, user_chat_id,
+                            config['analysis']['sentiment_threshold']['positive'],
+                            config['trading']['trade_amount'])
+    except Exception as e:
+        logging.error(f'Error during trading execution: {e}')
+
+    logging.info('Job completed.')
+
+def run_scheduler(config, session, bot, bonkbot_username, user_chat_id):
+    # Schedule the job every day at 10:00 AM
+    schedule.every().day.at("10:00").do(job, config, session, bot, bonkbot_username, user_chat_id)
+    logging.info('Scheduler started. Waiting for scheduled jobs.')
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+# ---------------------- Main Execution ----------------------
+
+def main():
+    setup_logging()
+    logging.info("Starting crypto bot on Google Cloud")
+    
+    try:
+        # Load secrets
+        secrets = load_secrets()
+        logging.info("Secrets loaded successfully")
+        
+        # Your bot logic here
+        
+    except Exception as e:
+        logging.error(f"Error in main: {e}")
+        raise
+
+if __name__ == "__main__":
+    main()
+    
